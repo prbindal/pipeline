@@ -23,6 +23,9 @@ import (
 	"testing"
 	"time"
 
+	"go.opencensus.io/metric/metricproducer"
+	"go.opencensus.io/stats/view"
+
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline"
 
 	"github.com/tektoncd/pipeline/pkg/apis/config"
@@ -50,9 +53,25 @@ func getConfigContext(countWithReason bool) context.Context {
 		Metrics: &config.Metrics{
 			TaskrunLevel:            config.TaskrunLevelAtTaskrun,
 			PipelinerunLevel:        config.PipelinerunLevelAtPipelinerun,
+			RunningPipelinerunLevel: config.DefaultRunningPipelinerunLevel,
 			DurationTaskrunType:     config.DefaultDurationTaskrunType,
 			DurationPipelinerunType: config.DefaultDurationPipelinerunType,
 			CountWithReason:         countWithReason,
+		},
+	}
+	return config.ToContext(ctx, cfg)
+}
+
+func getConfigContextRunningPRLevel(runningPipelinerunLevel string) context.Context {
+	ctx := context.Background()
+	cfg := &config.Config{
+		Metrics: &config.Metrics{
+			TaskrunLevel:            config.TaskrunLevelAtTaskrun,
+			PipelinerunLevel:        config.PipelinerunLevelAtPipelinerun,
+			DurationTaskrunType:     config.DefaultDurationTaskrunType,
+			DurationPipelinerunType: config.DefaultDurationPipelinerunType,
+			CountWithReason:         false,
+			RunningPipelinerunLevel: runningPipelinerunLevel,
 		},
 	}
 	return config.ToContext(ctx, cfg)
@@ -504,6 +523,55 @@ func TestRecordRunningPipelineRunsCount(t *testing.T) {
 	metricstest.CheckLastValueData(t, "running_pipelineruns", map[string]string{}, 1)
 }
 
+func TestRecordRunningPipelineRunsCountAtPipelineLevel(t *testing.T) {
+	unregisterMetrics()
+
+	newPipelineRun := func(status corev1.ConditionStatus, namespace string) *v1.PipelineRun {
+		return &v1.PipelineRun{
+			ObjectMeta: metav1.ObjectMeta{Name: names.SimpleNameGenerator.RestrictLengthWithRandomSuffix("pipelinerun-"), Namespace: namespace},
+			Status: v1.PipelineRunStatus{
+				Status: duckv1.Status{
+					Conditions: duckv1.Conditions{{
+						Type:   apis.ConditionSucceeded,
+						Status: status,
+					}},
+				},
+			},
+		}
+	}
+
+	ctx, _ := ttesting.SetupFakeContext(t)
+	informer := fakepipelineruninformer.Get(ctx)
+	// Add N randomly-named PipelineRuns with differently-succeeded statuses.
+	for _, pipelineRun := range []*v1.PipelineRun{
+		newPipelineRun(corev1.ConditionUnknown, "testns1"),
+		newPipelineRun(corev1.ConditionUnknown, "testns2"),
+		newPipelineRun(corev1.ConditionUnknown, "testns2"),
+		newPipelineRun(corev1.ConditionUnknown, "testns3"),
+		newPipelineRun(corev1.ConditionUnknown, "testns3"),
+		newPipelineRun(corev1.ConditionUnknown, "testns3"),
+		newPipelineRun(corev1.ConditionUnknown, "testns3"),
+	} {
+		if err := informer.Informer().GetIndexer().Add(pipelineRun); err != nil {
+			t.Fatalf("Adding TaskRun to informer: %v", err)
+		}
+	}
+
+	ctx = getConfigContextRunningPRLevel("pipeline")
+	recorder, err := NewRecorder(ctx)
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+
+	if err := recorder.RunningPipelineRuns(informer.Lister()); err != nil {
+		t.Errorf("RunningPipelineRuns: %v", err)
+	}
+
+	checkLastValueDataForTags(t, "running_pipelineruns", map[string]string{"namespace": "testns1", "pipeline": "anonymous"}, 1)
+	checkLastValueDataForTags(t, "running_pipelineruns", map[string]string{"namespace": "testns2", "pipeline": "anonymous"}, 2)
+	checkLastValueDataForTags(t, "running_pipelineruns", map[string]string{"namespace": "testns3", "pipeline": "anonymous"}, 4)
+}
+
 func TestRecordRunningPipelineRunsResolutionWaitCounts(t *testing.T) {
 	multiplier := 3
 	for _, tc := range []struct {
@@ -595,4 +663,41 @@ func unregisterMetrics() {
 	once = sync.Once{}
 	r = nil
 	errRegistering = nil
+}
+
+// We have to write this function as knative package does not provide the feature to validate multiple records for same metric.
+func checkLastValueDataForTags(t *testing.T, name string, wantTags map[string]string, expected float64) {
+	t.Helper()
+	for _, producer := range metricproducer.GlobalManager().GetAll() {
+		meter := producer.(view.Meter)
+		data, err := meter.RetrieveData(name)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		val := getLastValueData(data, wantTags)
+		if expected != val.Value {
+			t.Error("Value did not match for ", name, wantTags, ", expected", expected, "got", val.Value)
+		}
+	}
+}
+
+// Returns the LastValueData from the matching row. If no row is matched then returns nil
+func getLastValueData(rows []*view.Row, wantTags map[string]string) *view.LastValueData {
+	for _, row := range rows {
+		if len(wantTags) != len(row.Tags) {
+			continue
+		}
+		matched := true
+		for _, got := range row.Tags {
+			n := got.Key.Name()
+			if wantTags[n] != got.Value {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return row.Data.(*view.LastValueData)
+		}
+	}
+	return nil
 }
